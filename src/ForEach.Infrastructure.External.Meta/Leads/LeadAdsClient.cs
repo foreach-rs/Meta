@@ -35,7 +35,9 @@ public sealed class LeadAdsClient(
         {
             using var document = JsonDocument.Parse(body!);
 
-            return MetaResult<MetaLead>.Ok(ReadLead(document.RootElement));
+            return ReadLead(document.RootElement) is { } lead
+                ? MetaResult<MetaLead>.Ok(lead)
+                : MetaResult<MetaLead>.Transport("Meta answered with a lead that has no id.");
         }
         catch (JsonException)
         {
@@ -46,46 +48,50 @@ public sealed class LeadAdsClient(
     /// <summary>
     /// Every form on the Page, so a host can name them and choose which to import from.
     ///
-    /// A hundred, for the same reason the template list stops there: a business with more forms
-    /// than that has somebody managing them in Ads Manager, and a paging loop nobody exercises is a
-    /// worse risk than a list that stops.
+    /// Pages of a hundred, followed through `paging.next` until Meta stops offering one, and never
+    /// past fifty pages — a guard against a cursor that does not end, not a limit anyone should meet.
     /// </summary>
     public async Task<MetaResult<IReadOnlyList<MetaLeadFormInfo>>> GetFormsAsync(
         CancellationToken ct = default)
     {
-        var (body, error) = await GetAsync(
-            $"{page.PageId}/leadgen_forms?fields=id,name,status,questions&limit=100", ct);
-
-        if (error is not null) return Fail<IReadOnlyList<MetaLeadFormInfo>>(error);
-
         var forms = new List<MetaLeadFormInfo>();
 
-        try
-        {
-            using var document = JsonDocument.Parse(body!);
+        string? next = $"{page.PageId}/leadgen_forms?fields=id,name,status,questions&limit=100";
 
-            if (document.RootElement.TryGetProperty("data", out var data)
-                && data.ValueKind == JsonValueKind.Array)
+        for (var pages = 0; next is not null && pages < MetaJson.MaxPages; pages++)
+        {
+            var (body, error) = await GetAsync(next, ct);
+
+            if (error is not null) return Fail<IReadOnlyList<MetaLeadFormInfo>>(error);
+
+            try
             {
-                foreach (var element in data.EnumerateArray())
-                {
-                    if (Text(element, "id") is not { } id || Text(element, "name") is not { } name)
-                        continue;
+                using var document = JsonDocument.Parse(body!);
 
-                    forms.Add(new MetaLeadFormInfo(
-                        id,
-                        name,
-                        Text(element, "status"),
-                        element.TryGetProperty("questions", out var questions)
-                            ? questions.GetRawText()
-                            : null));
+                if (MetaJson.Property(document.RootElement, "data") is { ValueKind: JsonValueKind.Array } data)
+                {
+                    foreach (var element in data.EnumerateArray())
+                    {
+                        if (Text(element, "id") is not { } id || Text(element, "name") is not { } name)
+                            continue;
+
+                        forms.Add(new MetaLeadFormInfo(
+                            id,
+                            name,
+                            Text(element, "status"),
+                            MetaJson.Property(element, "questions") is { } questions
+                                ? questions.GetRawText()
+                                : null));
+                    }
                 }
+
+                next = MetaJson.NextPage(document.RootElement, app.GraphRoot);
             }
-        }
-        catch (JsonException)
-        {
-            return MetaResult<IReadOnlyList<MetaLeadFormInfo>>.Transport(
-                "Meta answered with something that is not JSON.");
+            catch (JsonException)
+            {
+                return MetaResult<IReadOnlyList<MetaLeadFormInfo>>.Transport(
+                    "Meta answered with something that is not JSON.");
+            }
         }
 
         return MetaResult<IReadOnlyList<MetaLeadFormInfo>>.Ok(forms);
@@ -97,37 +103,48 @@ public sealed class LeadAdsClient(
     /// This is what makes a missed webhook recoverable — and what imports the leads that arrived
     /// before the integration was switched on at all. `since` is Unix seconds, Meta's own filter,
     /// so the window is applied on their side rather than by fetching everything and discarding.
+    /// Pages of a hundred are followed through `paging.next`, up to fifty pages.
     /// </summary>
     public async Task<MetaResult<IReadOnlyList<MetaLead>>> GetFormLeadsAsync(
         string formId, DateTime since, CancellationToken ct = default)
     {
-        var seconds = new DateTimeOffset(DateTime.SpecifyKind(since, DateTimeKind.Utc))
-            .ToUnixTimeSeconds();
+        // Local becomes UTC properly; Unspecified is taken as UTC, which is what a host storing
+        // UTC without a Kind means.
+        var utc = since.Kind == DateTimeKind.Local
+            ? since.ToUniversalTime()
+            : DateTime.SpecifyKind(since, DateTimeKind.Utc);
 
-        var (body, error) = await GetAsync(
-            $"{formId}/leads?fields={LeadFields}&filtering="
-            + $"[{{\"field\":\"time_created\",\"operator\":\"GREATER_THAN\",\"value\":{seconds}}}]"
-            + "&limit=100",
-            ct);
-
-        if (error is not null) return Fail<IReadOnlyList<MetaLead>>(error);
+        var seconds = new DateTimeOffset(utc).ToUnixTimeSeconds();
 
         var leads = new List<MetaLead>();
 
-        try
-        {
-            using var document = JsonDocument.Parse(body!);
+        string? next =
+            $"{formId}/leads?fields={LeadFields}&filtering="
+            + $"[{{\"field\":\"time_created\",\"operator\":\"GREATER_THAN\",\"value\":{seconds}}}]"
+            + "&limit=100";
 
-            if (document.RootElement.TryGetProperty("data", out var data)
-                && data.ValueKind == JsonValueKind.Array)
-            {
-                leads.AddRange(data.EnumerateArray().Select(ReadLead).Where(lead => lead.Id.Length > 0));
-            }
-        }
-        catch (JsonException)
+        for (var pages = 0; next is not null && pages < MetaJson.MaxPages; pages++)
         {
-            return MetaResult<IReadOnlyList<MetaLead>>.Transport(
-                "Meta answered with something that is not JSON.");
+            var (body, error) = await GetAsync(next, ct);
+
+            if (error is not null) return Fail<IReadOnlyList<MetaLead>>(error);
+
+            try
+            {
+                using var document = JsonDocument.Parse(body!);
+
+                if (MetaJson.Property(document.RootElement, "data") is { ValueKind: JsonValueKind.Array } data)
+                {
+                    leads.AddRange(data.EnumerateArray().Select(ReadLead).OfType<MetaLead>());
+                }
+
+                next = MetaJson.NextPage(document.RootElement, app.GraphRoot);
+            }
+            catch (JsonException)
+            {
+                return MetaResult<IReadOnlyList<MetaLead>>.Transport(
+                    "Meta answered with something that is not JSON.");
+            }
         }
 
         return MetaResult<IReadOnlyList<MetaLead>>.Ok(leads);
@@ -164,20 +181,25 @@ public sealed class LeadAdsClient(
                 ? MetaResult<bool>.Fail(error)
                 : MetaResult<bool>.Transport($"Meta answered {(int)response.StatusCode}.");
         }
-        catch (Exception exception)
-            when (exception is not OperationCanceledException || ct.IsCancellationRequested)
+        catch (Exception exception) when (exception is not OperationCanceledException)
         {
             return MetaResult<bool>.Transport(exception.Message);
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
             return MetaResult<bool>.Transport(
                 $"Meta did not answer within {_timeout.TotalSeconds:0} s.");
         }
     }
 
-    private static MetaLead ReadLead(JsonElement element) =>
-        new(Text(element, "id") ?? "",
+    /// <summary>The lead, or null when the element is not an object or carries no id.</summary>
+    private static MetaLead? ReadLead(JsonElement element) =>
+        element.ValueKind != JsonValueKind.Object || Text(element, "id") is not { } id
+            ? null
+            : ReadLead(element, id);
+
+    private static MetaLead ReadLead(JsonElement element, string id) =>
+        new(id,
             Time(element),
             Text(element, "form_id"),
             Text(element, "ad_id"),
@@ -186,8 +208,7 @@ public sealed class LeadAdsClient(
             Text(element, "adset_name"),
             Text(element, "campaign_id"),
             Text(element, "campaign_name"),
-            element.TryGetProperty("is_organic", out var organic)
-            && organic.ValueKind == JsonValueKind.True,
+            MetaJson.Property(element, "is_organic") is { ValueKind: JsonValueKind.True },
             Text(element, "platform"),
             ReadFields(element));
 
@@ -242,12 +263,14 @@ public sealed class LeadAdsClient(
 
             deadline.CancelAfter(_timeout);
 
-            var separator = path.Contains('?', StringComparison.Ordinal) ? '&' : '?';
+            // A `paging.next` URL is absolute and already carries its token.
+            var url = path.StartsWith("http", StringComparison.OrdinalIgnoreCase)
+              && Uri.TryCreate(path, UriKind.Absolute, out var absolute)
+                ? absolute.AbsoluteUri
+                : $"{app.GraphRoot}/{path}{(path.Contains('?', StringComparison.Ordinal) ? '&' : '?')}"
+                  + $"access_token={Uri.EscapeDataString(page.PageAccessToken)}";
 
-            using var response = await httpClient.GetAsync(
-                $"{app.GraphRoot}/{path}{separator}access_token="
-                + Uri.EscapeDataString(page.PageAccessToken),
-                deadline.Token);
+            using var response = await httpClient.GetAsync(url, deadline.Token);
 
             var body = await response.Content.ReadAsStringAsync(deadline.Token);
 
@@ -257,12 +280,11 @@ public sealed class LeadAdsClient(
                 ? MetaResult<object>.Fail(error)
                 : MetaResult<object>.Transport($"Meta answered {(int)response.StatusCode}."));
         }
-        catch (Exception exception)
-            when (exception is not OperationCanceledException || ct.IsCancellationRequested)
+        catch (Exception exception) when (exception is not OperationCanceledException)
         {
             return (null, MetaResult<object>.Transport(exception.Message));
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
             return (null, MetaResult<object>.Transport(
                 $"Meta did not answer within {_timeout.TotalSeconds:0} s."));

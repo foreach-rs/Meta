@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 
 namespace ForEach.Infrastructure.External.Meta;
@@ -43,6 +44,16 @@ public sealed record MetaError(int Code, int? Subcode, string Type, string Messa
         // The messaging window has shut, or this person cannot be written to. Both are permanent
         // until the customer writes first, and neither is anybody's mistake.
         (10, 2018278) or (10, 2018065) or (551, _) => MetaFailureKind.PolicyRefused,
+
+        // Permission missing or not granted: code 10 without one of the subcodes above, and the
+        // whole 200 range Meta uses for individual permissions. Somebody has to grant access.
+        (10, _) or ( >= 200 and <= 299, _) => MetaFailureKind.Configuration,
+
+        // WhatsApp: payment method missing / business not registered for the API. Account setup.
+        (131042 or 131031, _) => MetaFailureKind.Configuration,
+
+        // WhatsApp: bad message type, media or parameter. The request is wrong and stays wrong.
+        (131008 or 131009 or 131021, _) => MetaFailureKind.CallerMistake,
 
         // WhatsApp's own refusals: re-engagement needs a template, recipient unavailable,
         // unsupported message type, number not in the test allow-list.
@@ -115,8 +126,22 @@ public sealed record MetaError(int Code, int? Subcode, string Type, string Messa
             ? value.GetString()
             : null;
 
-    private static int? Number(JsonElement parent, string name) =>
-        parent.TryGetProperty(name, out var value) && value.TryGetInt32(out var parsed)
-            ? parsed
-            : null;
+    private static int? Number(JsonElement parent, string name)
+    {
+        if (!parent.TryGetProperty(name, out var value)) return null;
+
+        switch (value.ValueKind)
+        {
+            case JsonValueKind.Number when value.TryGetInt32(out var whole):
+                return whole;
+            case JsonValueKind.Number when value.TryGetDecimal(out var fraction)
+                                          && fraction >= int.MinValue && fraction <= int.MaxValue:
+                return (int)fraction;
+            case JsonValueKind.String when int.TryParse(
+                value.GetString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var text):
+                return text;
+            default:
+                return null;
+        }
+    }
 }

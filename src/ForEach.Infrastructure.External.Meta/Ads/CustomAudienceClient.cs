@@ -1,5 +1,4 @@
 using System.Globalization;
-using System.Text;
 using System.Text.Json;
 using ForEach.Infrastructure.External.Meta.Credentials;
 
@@ -59,14 +58,16 @@ public sealed class CustomAudienceClient(
         {
             using var document = JsonDocument.Parse(body!);
 
-            return document.RootElement.TryGetProperty("id", out var id)
-                   && id.ValueKind is JsonValueKind.String or JsonValueKind.Number
+            // A 2xx that does not name the audience is an unknown outcome: it may well exist, and
+            // creating it again makes a second one.
+            return MetaJson.Property(document.RootElement, "id") is
+                   { ValueKind: JsonValueKind.String or JsonValueKind.Number } id
                 ? MetaResult<string>.Ok(id.ToString())
-                : MetaResult<string>.Transport("Meta created the audience without naming it.");
+                : MetaResult<string>.Unknown("Meta created the audience without naming it.");
         }
         catch (JsonException)
         {
-            return MetaResult<string>.Transport("Meta answered with something that is not JSON.");
+            return MetaResult<string>.Unknown("Meta answered with something that is not JSON.");
         }
     }
 
@@ -111,14 +112,15 @@ public sealed class CustomAudienceClient(
             // Meta answers with how many it actually received. Returned rather than assumed: it is
             // routinely lower than what was sent, because rows it cannot use are dropped silently
             // and a host that reported the sent count would overstate every audience it builds.
-            return document.RootElement.TryGetProperty("num_received", out var received)
+            return MetaJson.Property(document.RootElement, "num_received") is
+                   { ValueKind: JsonValueKind.Number } received
                    && received.TryGetInt32(out var count)
                 ? MetaResult<int>.Ok(count)
                 : MetaResult<int>.Ok(people.Count);
         }
         catch (JsonException)
         {
-            return MetaResult<int>.Transport("Meta answered with something that is not JSON.");
+            return MetaResult<int>.Unknown("Meta answered with something that is not JSON.");
         }
     }
 
@@ -152,20 +154,27 @@ public sealed class CustomAudienceClient(
                         CultureInfo.InvariantCulture,
                         $"Meta answered {(int)response.StatusCode}.")));
         }
-        catch (Exception exception)
-            when (exception is not OperationCanceledException || ct.IsCancellationRequested)
+        catch (HttpRequestException exception) when (!MetaJson.NeverConnected(exception))
+        {
+            // The request may have left; whether Meta acted on it is not known.
+            return (null, MetaResult<object>.Unknown(exception.Message));
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            // Our own deadline; a caller's cancellation propagates.
+            return (null, MetaResult<object>.Unknown(
+                $"Meta did not answer within {_timeout.TotalSeconds:0} s; the request may have been applied."));
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
         {
             return (null, MetaResult<object>.Transport(exception.Message));
-        }
-        catch (OperationCanceledException)
-        {
-            return (null, MetaResult<object>.Transport(
-                $"Meta did not answer within {_timeout.TotalSeconds:0} s."));
         }
     }
 
     private static MetaResult<T> Fail<T>(MetaResult<object> error) =>
         error.Error is { } reported
             ? MetaResult<T>.Fail(reported)
-            : MetaResult<T>.Transport(error.TransportFailure ?? "");
+            : error.IsOutcomeUnknown
+                ? MetaResult<T>.Unknown(error.TransportFailure ?? "")
+                : MetaResult<T>.Transport(error.TransportFailure ?? "");
 }

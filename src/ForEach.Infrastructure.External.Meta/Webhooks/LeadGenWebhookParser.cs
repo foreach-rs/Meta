@@ -116,9 +116,7 @@ public static class LeadGenWebhookParser
     /// telephones.
     /// </summary>
     private static DateTime Time(JsonElement value) =>
-        value.TryGetProperty("created_time", out var created) && created.TryGetInt64(out var seconds)
-            ? DateTimeOffset.FromUnixTimeSeconds(seconds).UtcDateTime
-            : DateTime.UtcNow;
+        MetaJson.UnixTime(value, "created_time", milliseconds: false) ?? DateTime.UtcNow;
 
     private static string? Text(JsonElement element, string name)
     {

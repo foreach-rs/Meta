@@ -32,6 +32,10 @@ namespace ForEach.Infrastructure.External.Meta.Webhooks;
 /// When Meta says it was sent, in UTC. Now when the payload carries no usable timestamp, so a
 /// message never sorts to the epoch.
 /// </param>
+/// <param name="ReplyPayload">
+/// The developer payload of a WhatsApp quick-reply or interactive button the customer tapped, when
+/// there was one. Body carries the words they saw; this carries what the template author attached.
+/// </param>
 public sealed record MetaInboundMessage(
     MetaChannel Channel,
     string ThreadKey,
@@ -40,7 +44,8 @@ public sealed record MetaInboundMessage(
     string From,
     string? FromDisplayName,
     string Body,
-    DateTime SentAt);
+    DateTime SentAt,
+    string? ReplyPayload = null);
 
 /// <summary>
 /// What became of one message we sent, as WhatsApp reports it.

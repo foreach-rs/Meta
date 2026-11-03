@@ -13,8 +13,9 @@ namespace ForEach.Infrastructure.External.Meta;
 /// </summary>
 public sealed class MetaResult<T>
 {
-    private MetaResult(T? value, MetaError? error, string? transportFailure)
+    private MetaResult(T? value, MetaError? error, string? transportFailure, bool outcomeUnknown = false)
     {
+        IsOutcomeUnknown = outcomeUnknown;
         Value = value;
         Error = error;
         TransportFailure = transportFailure;
@@ -33,6 +34,16 @@ public sealed class MetaResult<T>
     public bool IsSuccess => Error is null && TransportFailure is null;
 
     /// <summary>
+    /// True when a send may have been acted on although no usable answer came back. Also true of
+    /// <see cref="TransportFailure"/>, which then carries the reason, but never retryable.
+    /// </summary>
+    public bool IsOutcomeUnknown { get; }
+
+    /// <summary>Succeeded, Failed, or Unknown — the last for a send that may already have gone out.</summary>
+    public MetaOutcome Outcome =>
+        IsOutcomeUnknown ? MetaOutcome.Unknown : IsSuccess ? MetaOutcome.Succeeded : MetaOutcome.Failed;
+
+    /// <summary>
     /// One sentence naming what went wrong, in Meta's own words where there are any.
     ///
     /// The host writes this into a job-run record or shows it to whoever pressed send, so it is
@@ -41,9 +52,12 @@ public sealed class MetaResult<T>
     /// </summary>
     public string FailureMessage => Error?.ToString() ?? TransportFailure ?? "";
 
-    /// <summary>Retrying is worth it only for a transport problem or a Meta-side one.</summary>
+    /// <summary>
+    /// Retrying is worth it only for a transport problem or a Meta-side one — and never for an
+    /// unknown outcome, because repeating a send that may have gone out sends it twice.
+    /// </summary>
     public bool IsWorthRetrying =>
-        TransportFailure is not null || Error?.Kind == MetaFailureKind.Transient;
+        !IsOutcomeUnknown && (TransportFailure is not null || Error?.Kind == MetaFailureKind.Transient);
 
     /// <summary>A call that answered.</summary>
     public static MetaResult<T> Ok(T value) => new(value, null, null);
@@ -53,4 +67,10 @@ public sealed class MetaResult<T>
 
     /// <summary>A call that never got an answer. The message is what the host logs.</summary>
     public static MetaResult<T> Transport(string message) => new(default, null, message);
+
+    /// <summary>
+    /// A send whose fate is not known. <see cref="IsSuccess"/> is false and
+    /// <see cref="IsWorthRetrying"/> is false; the message says why.
+    /// </summary>
+    public static MetaResult<T> Unknown(string message) => new(default, null, message, true);
 }

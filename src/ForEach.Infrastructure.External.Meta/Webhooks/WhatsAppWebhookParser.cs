@@ -133,7 +133,8 @@ public static class WhatsAppWebhookParser
     /// </summary>
     private static string? Error(JsonElement element)
     {
-        if (!element.TryGetProperty("errors", out var errors)
+        if (element.ValueKind != JsonValueKind.Object
+            || !element.TryGetProperty("errors", out var errors)
             || errors.ValueKind != JsonValueKind.Array)
         {
             return null;
@@ -158,7 +159,8 @@ public static class WhatsAppWebhookParser
     /// </summary>
     private static IEnumerable<JsonElement> Values(JsonElement root)
     {
-        if (!root.TryGetProperty("entry", out var entries)
+        if (root.ValueKind != JsonValueKind.Object
+            || !root.TryGetProperty("entry", out var entries)
             || entries.ValueKind != JsonValueKind.Array)
         {
             yield break;
@@ -166,7 +168,8 @@ public static class WhatsAppWebhookParser
 
         foreach (var entry in entries.EnumerateArray())
         {
-            if (!entry.TryGetProperty("changes", out var changes)
+            if (entry.ValueKind != JsonValueKind.Object
+                || !entry.TryGetProperty("changes", out var changes)
                 || changes.ValueKind != JsonValueKind.Array)
             {
                 continue;
@@ -174,7 +177,8 @@ public static class WhatsAppWebhookParser
 
             foreach (var change in changes.EnumerateArray())
             {
-                if (change.TryGetProperty("value", out var value)
+                if (change.ValueKind == JsonValueKind.Object
+                    && change.TryGetProperty("value", out var value)
                     && value.ValueKind == JsonValueKind.Object)
                 {
                     yield return value;
@@ -209,8 +213,15 @@ public static class WhatsAppWebhookParser
             From: from,
             FromDisplayName: displayName,
             Body: Body(element),
-            SentAt: Timestamp(element));
+            SentAt: Timestamp(element),
+            ReplyPayload: ReplyPayload(element));
     }
+
+    private static string? ReplyPayload(JsonElement element) =>
+        String(element, "type") == "button"
+        && element.TryGetProperty("button", out var button)
+            ? String(button, "payload")
+            : null;
 
     /// <summary>
     /// What the message says, or what kind of thing arrived instead.
@@ -231,7 +242,7 @@ public static class WhatsAppWebhookParser
 
             // An interactive reply and a button reply both carry the words the customer tapped,
             // which read as their answer and are the only thing in the row worth showing.
-            var tapped = String(payload, "title") ?? Nested(payload, "button_reply", "title")
+            var tapped = String(payload, "title") ?? ButtonText(type, payload) ?? Nested(payload, "button_reply", "title")
                          ?? Nested(payload, "list_reply", "title");
 
             if (tapped is not null) return tapped;
@@ -260,7 +271,8 @@ public static class WhatsAppWebhookParser
         {
             var waId = String(contact, "wa_id");
 
-            var name = contact.TryGetProperty("profile", out var profile)
+            var name = contact.ValueKind == JsonValueKind.Object
+                       && contact.TryGetProperty("profile", out var profile)
                 ? String(profile, "name")
                 : null;
 
@@ -276,12 +288,19 @@ public static class WhatsAppWebhookParser
     /// either way it leaves the thread at an end nobody scrolls to.
     /// </summary>
     private static DateTime Timestamp(JsonElement element) =>
-        String(element, "timestamp") is { } value && long.TryParse(value, out var seconds)
-            ? DateTimeOffset.FromUnixTimeSeconds(seconds).UtcDateTime
-            : DateTime.UtcNow;
+        MetaJson.UnixTime(element, "timestamp", milliseconds: false) ?? DateTime.UtcNow;
+
+    /// <summary>
+    /// A template quick-reply arrives as type `button` with `button.text` (what the customer saw)
+    /// and `button.payload` (what the template author attached). The text is the answer.
+    /// </summary>
+    private static string? ButtonText(string type, JsonElement payload) =>
+        type == "button" ? String(payload, "text") : null;
 
     private static string? Nested(JsonElement element, string name, string inner) =>
-        element.TryGetProperty(name, out var value) ? String(value, inner) : null;
+        element.ValueKind == JsonValueKind.Object && element.TryGetProperty(name, out var value)
+            ? String(value, inner)
+            : null;
 
     private static string? String(JsonElement element, string name) =>
         element.ValueKind == JsonValueKind.Object

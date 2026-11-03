@@ -30,8 +30,9 @@ public sealed class AdsInsightsClient(
     /// <summary>
     /// Every campaign's daily figures between two dates, inclusive.
     ///
-    /// One page. A month of a handful of campaigns fits comfortably, and a paging loop nobody
-    /// exercises is a worse risk than a window that has to be asked for twice.
+    /// Pages of five hundred rows, followed through `paging.next` until Meta stops offering one and
+    /// never past fifty pages — a guard against a cursor that does not end, not a limit anyone
+    /// should meet.
     /// </summary>
     public async Task<MetaResult<IReadOnlyList<MetaAdInsight>>> GetDailyAsync(
         DateOnly from, DateOnly to, CancellationToken ct = default)
@@ -42,35 +43,39 @@ public sealed class AdsInsightsClient(
             until = to.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)
         });
 
-        var (body, error) = await GetAsync(
-            $"{Account}/insights?level=campaign&time_increment=1&limit=500"
-            + $"&fields={Fields}&time_range={Uri.EscapeDataString(range)}",
-            ct);
+        var rows = new List<MetaAdInsight>();
 
-        if (error is not null) return Fail<IReadOnlyList<MetaAdInsight>>(error);
+        string? next = $"{Account}/insights?level=campaign&time_increment=1&limit=500"
+                       + $"&fields={Fields}&time_range={Uri.EscapeDataString(range)}";
 
-        try
+        for (var pages = 0; next is not null && pages < MetaJson.MaxPages; pages++)
         {
-            using var document = JsonDocument.Parse(body!);
+            var (body, error) = await GetAsync(next, ct);
 
-            var rows = new List<MetaAdInsight>();
+            if (error is not null) return Fail<IReadOnlyList<MetaAdInsight>>(error);
 
-            if (document.RootElement.TryGetProperty("data", out var data)
-                && data.ValueKind == JsonValueKind.Array)
+            try
             {
-                foreach (var element in data.EnumerateArray())
-                {
-                    if (Read(element) is { } insight) rows.Add(insight);
-                }
-            }
+                using var document = JsonDocument.Parse(body!);
 
-            return MetaResult<IReadOnlyList<MetaAdInsight>>.Ok(rows);
+                if (MetaJson.Property(document.RootElement, "data") is { ValueKind: JsonValueKind.Array } data)
+                {
+                    foreach (var element in data.EnumerateArray())
+                    {
+                        if (Read(element) is { } insight) rows.Add(insight);
+                    }
+                }
+
+                next = MetaJson.NextPage(document.RootElement, app.GraphRoot);
+            }
+            catch (JsonException)
+            {
+                return MetaResult<IReadOnlyList<MetaAdInsight>>.Transport(
+                    "Meta answered with something that is not JSON.");
+            }
         }
-        catch (JsonException)
-        {
-            return MetaResult<IReadOnlyList<MetaAdInsight>>.Transport(
-                "Meta answered with something that is not JSON.");
-        }
+
+        return MetaResult<IReadOnlyList<MetaAdInsight>>.Ok(rows);
     }
 
     /// <summary>The account's currency, so a host does not assume the figures are in its own.</summary>
@@ -126,11 +131,16 @@ public sealed class AdsInsightsClient(
     /// Three spellings, because Meta reports a lead from an Instant Form as `leadgen.other`, one
     /// from an on-site form as `lead`, and the grouped variant on newer objectives — and a host
     /// reading only one of them shows nought results for a campaign that is working.
+    ///
+    /// UNCONFIRMED, and possibly a double count: Meta may report `lead` as the aggregate of the
+    /// other two, in which case summing all three counts each lead twice (or three times). The
+    /// arithmetic is deliberately left as it was until it has been checked against a real
+    /// Insights response for an account running Instant Forms — look at one `actions` array
+    /// that has `lead` beside `leadgen.other` and compare the values.
     /// </summary>
     private static long Results(JsonElement element)
     {
-        if (!element.TryGetProperty("actions", out var actions)
-            || actions.ValueKind != JsonValueKind.Array)
+        if (MetaJson.Property(element, "actions") is not { ValueKind: JsonValueKind.Array } actions)
         {
             return 0;
         }
@@ -160,12 +170,14 @@ public sealed class AdsInsightsClient(
 
             deadline.CancelAfter(_timeout);
 
-            var separator = path.Contains('?', StringComparison.Ordinal) ? '&' : '?';
+            // A `paging.next` URL is absolute and already carries its token.
+            var url = path.StartsWith("http", StringComparison.OrdinalIgnoreCase)
+                      && Uri.TryCreate(path, UriKind.Absolute, out var absolute)
+                ? absolute.AbsoluteUri
+                : $"{app.GraphRoot}/{path}{(path.Contains('?', StringComparison.Ordinal) ? '&' : '?')}"
+                  + $"access_token={Uri.EscapeDataString(accessToken)}";
 
-            using var response = await httpClient.GetAsync(
-                $"{app.GraphRoot}/{path}{separator}access_token="
-                + Uri.EscapeDataString(accessToken),
-                deadline.Token);
+            using var response = await httpClient.GetAsync(url, deadline.Token);
 
             var body = await response.Content.ReadAsStringAsync(deadline.Token);
 
@@ -175,12 +187,11 @@ public sealed class AdsInsightsClient(
                 ? MetaResult<object>.Fail(error)
                 : MetaResult<object>.Transport($"Meta answered {(int)response.StatusCode}."));
         }
-        catch (Exception exception)
-            when (exception is not OperationCanceledException || ct.IsCancellationRequested)
+        catch (Exception exception) when (exception is not OperationCanceledException)
         {
             return (null, MetaResult<object>.Transport(exception.Message));
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
             return (null, MetaResult<object>.Transport(
                 $"Meta did not answer within {_timeout.TotalSeconds:0} s."));
@@ -190,7 +201,9 @@ public sealed class AdsInsightsClient(
     private static MetaResult<T> Fail<T>(MetaResult<object> error) =>
         error.Error is { } reported
             ? MetaResult<T>.Fail(reported)
-            : MetaResult<T>.Transport(error.TransportFailure ?? "");
+            : error.IsOutcomeUnknown
+                ? MetaResult<T>.Unknown(error.TransportFailure ?? "")
+                : MetaResult<T>.Transport(error.TransportFailure ?? "");
 
     private static string? Text(JsonElement element, string name)
     {

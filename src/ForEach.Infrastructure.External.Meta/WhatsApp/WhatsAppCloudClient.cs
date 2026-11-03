@@ -81,21 +81,29 @@ public sealed class WhatsAppCloudClient(
     /// <summary>
     /// Every template on the business account, approved or not.
     ///
-    /// A hundred, because the alternative is paging a list that is realistically five rows long. A
-    /// business with more than that has somebody managing them in Meta's console, and a sync
-    /// noticing only the first hundred is a smaller problem than a paging loop nobody exercises.
+    /// Pages of a hundred, followed through `paging.next` until Meta stops offering one and never
+    /// past fifty pages — a guard against a cursor that does not end, not a limit anyone should meet.
     /// </summary>
     public async Task<MetaResult<IReadOnlyList<WhatsAppTemplateInfo>>> GetTemplatesAsync(
         CancellationToken ct = default)
     {
-        var path = $"{whatsApp.WabaId}/message_templates"
-                   + "?fields=name,language,status,category,components&limit=100";
+        var templates = new List<WhatsAppTemplateInfo>();
 
-        var (body, error) = await SendAsync(HttpMethod.Get, path, null, ct);
+        string? path = $"{whatsApp.WabaId}/message_templates"
+                       + "?fields=name,language,status,category,components&limit=100";
 
-        if (error is not null) return Fail<IReadOnlyList<WhatsAppTemplateInfo>>(error);
+        for (var pages = 0; path is not null && pages < MetaJson.MaxPages; pages++)
+        {
+            var (body, error) = await SendAsync(HttpMethod.Get, path, null, ct);
 
-        return MetaResult<IReadOnlyList<WhatsAppTemplateInfo>>.Ok(WhatsAppTemplateReader.Read(body!));
+            if (error is not null) return Fail<IReadOnlyList<WhatsAppTemplateInfo>>(error);
+
+            templates.AddRange(WhatsAppTemplateReader.Read(body!));
+
+            path = NextPage(body!);
+        }
+
+        return MetaResult<IReadOnlyList<WhatsAppTemplateInfo>>.Ok(templates);
     }
 
     /// <summary>
@@ -112,9 +120,9 @@ public sealed class WhatsAppCloudClient(
         return MessageId(body!) is { } id
             ? MetaResult<string>.Ok(id)
 
-            // Accepted without an id is a message that cannot be recorded, and a row under an
-            // invented id is one no delivery receipt will ever match.
-            : MetaResult<string>.Transport("WhatsApp accepted the message without an id.");
+            // Accepted without a readable id is a message that cannot be recorded — and one that
+            // may well have been sent, so it is an unknown outcome and never a retry.
+            : MetaResult<string>.Unknown("WhatsApp accepted the message without a readable id.");
     }
 
     private async Task<(string? Body, MetaResult<object>? Error)> SendAsync(
@@ -149,22 +157,48 @@ public sealed class WhatsAppCloudClient(
                 ? MetaResult<object>.Fail(error)
                 : MetaResult<object>.Transport($"Meta answered {(int)response.StatusCode}."));
         }
-        catch (Exception exception)
-            when (exception is not OperationCanceledException || ct.IsCancellationRequested)
+        catch (HttpRequestException exception)
+            when (method == HttpMethod.Post && !MetaJson.NeverConnected(exception))
+        {
+            // The send may have left; whether Meta acted on it is not known.
+            return (null, MetaResult<object>.Unknown(exception.Message));
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            // Our own deadline; a caller's cancellation propagates. For a send the request left,
+            // so the outcome is unknown rather than a failure to retry.
+            var message = $"Meta did not answer within {_timeout.TotalSeconds:0} s.";
+
+            return (null, method == HttpMethod.Post
+                ? MetaResult<object>.Unknown(message + " The message may have been sent.")
+                : MetaResult<object>.Transport(message));
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
         {
             return (null, MetaResult<object>.Transport(exception.Message));
-        }
-        catch (OperationCanceledException)
-        {
-            return (null, MetaResult<object>.Transport(
-                $"Meta did not answer within {_timeout.TotalSeconds:0} s."));
         }
     }
 
     private static MetaResult<T> Fail<T>(MetaResult<object> error) =>
         error.Error is { } reported
             ? MetaResult<T>.Fail(reported)
-            : MetaResult<T>.Transport(error.TransportFailure ?? "");
+            : error.IsOutcomeUnknown
+                ? MetaResult<T>.Unknown(error.TransportFailure ?? "")
+                : MetaResult<T>.Transport(error.TransportFailure ?? "");
+
+    private string? NextPage(string body)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(body);
+
+            return MetaJson.NextPage(document.RootElement, app.GraphRoot);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
 
     /// <summary>
     /// The id, which the Cloud API buries one array deep: `messages[0].id`. Nothing like the Page
@@ -176,15 +210,15 @@ public sealed class WhatsAppCloudClient(
         {
             using var document = JsonDocument.Parse(body);
 
-            if (!document.RootElement.TryGetProperty("messages", out var messages)
-                || messages.ValueKind != JsonValueKind.Array)
+            if (MetaJson.Property(document.RootElement, "messages") is not
+                { ValueKind: JsonValueKind.Array } messages)
             {
                 return null;
             }
 
             foreach (var message in messages.EnumerateArray())
             {
-                if (message.TryGetProperty("id", out var id)
+                if (MetaJson.Property(message, "id") is { ValueKind: JsonValueKind.String } id
                     && id.GetString() is { Length: > 0 } value)
                 {
                     return value;

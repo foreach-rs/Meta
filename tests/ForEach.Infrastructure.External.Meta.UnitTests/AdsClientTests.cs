@@ -182,9 +182,15 @@ public class AdsClientTests
     {
         // No trunk-zero stripping here: a leading zero inside a country code is a real digit, and
         // removing it would corrupt numbers this application never sees but the library might.
+        // A plus or a 00 marks the number as international; without either it is national, even
+        // when it happens to start with the country-code digits.
         Assert.Equal(
-            AudienceHash.Phone("381601234567", "381"),
+            AudienceHash.Phone("+381601234567", "381"),
             AudienceHash.Phone("+381 60 123 4567", "381"));
+
+        Assert.Equal(
+            AudienceHash.Phone("+381601234567", "381"),
+            AudienceHash.Phone("00381 60 123 4567", "381"));
     }
 
     [Fact]

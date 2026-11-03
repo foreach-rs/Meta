@@ -65,24 +65,41 @@ public sealed class MessengerClient(
             using var document = JsonDocument.Parse(body);
 
             // No message id in a 200 would mean Meta accepted something the caller cannot record.
-            // Reported as a failure rather than invented: a row under a made-up id is a row the
+            // Reported as an unknown outcome rather than invented, and never as retryable: the
+            // message may well have gone out, and a row under a made-up id is a row the
             // customer's reply will never thread to.
-            return document.RootElement.TryGetProperty("message_id", out var id)
+            return MetaJson.Property(document.RootElement, "message_id") is
+                   { ValueKind: JsonValueKind.String } id
                    && id.GetString() is { Length: > 0 } messageId
                 ? MetaResult<string>.Ok(messageId)
-                : MetaResult<string>.Transport("Meta accepted the message without an id.");
+                : MetaResult<string>.Unknown("Meta accepted the message without a readable id.");
         }
-        catch (Exception exception)
-            when (exception is not OperationCanceledException || ct.IsCancellationRequested)
+        catch (JsonException)
         {
+            return MetaResult<string>.Unknown(
+                "Meta accepted the message but the answer could not be read.");
+        }
+        catch (HttpRequestException exception) when (MetaJson.NeverConnected(exception))
+        {
+            // Name resolution, refused connection, TLS: nothing reached Meta, so a repeat is safe.
             return MetaResult<string>.Transport(exception.Message);
         }
-        catch (OperationCanceledException)
+        catch (HttpRequestException exception)
+        {
+            // The request may have left; whether Meta acted on it is not known.
+            return MetaResult<string>.Unknown(exception.Message);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
             // Our own deadline rather than a caller cancelling, said plainly: "the request was
-            // cancelled" reads like somebody clicked away.
-            return MetaResult<string>.Transport(
-                $"Meta did not answer within {_timeout.TotalSeconds:0} s.");
+            // cancelled" reads like somebody clicked away. The request left, so the outcome is
+            // unknown rather than a failure to retry. A caller's own cancellation propagates.
+            return MetaResult<string>.Unknown(
+                $"Meta did not answer within {_timeout.TotalSeconds:0} s; the message may have been sent.");
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            return MetaResult<string>.Unknown(exception.Message);
         }
     }
 
@@ -106,7 +123,7 @@ public sealed class MessengerClient(
             deadline.CancelAfter(_timeout);
 
             var response = await httpClient.GetAsync(
-                $"{app.GraphRoot}/{userId}?fields=name,first_name,last_name"
+                $"{app.GraphRoot}/{Uri.EscapeDataString(userId)}?fields=name,first_name,last_name"
                 + $"&access_token={Uri.EscapeDataString(page.PageAccessToken)}",
                 deadline.Token);
 
@@ -115,19 +132,11 @@ public sealed class MessengerClient(
             using var document = JsonDocument.Parse(
                 await response.Content.ReadAsStringAsync(deadline.Token));
 
-            if (document.RootElement.TryGetProperty("name", out var name)
-                && name.GetString() is { Length: > 0 } full)
-            {
-                return full;
-            }
+            if (Name(document.RootElement, "name") is { Length: > 0 } full) return full;
 
-            var first = document.RootElement.TryGetProperty("first_name", out var firstName)
-                ? firstName.GetString()
-                : null;
+            var first = Name(document.RootElement, "first_name");
 
-            var last = document.RootElement.TryGetProperty("last_name", out var lastName)
-                ? lastName.GetString()
-                : null;
+            var last = Name(document.RootElement, "last_name");
 
             var joined = $"{first} {last}".Trim();
 
@@ -137,9 +146,15 @@ public sealed class MessengerClient(
         {
             return null;
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
+            // Our own deadline. A caller's cancellation propagates.
             return null;
         }
     }
+
+    private static string? Name(JsonElement root, string property) =>
+        MetaJson.Property(root, property) is { ValueKind: JsonValueKind.String } value
+            ? value.GetString()
+            : null;
 }

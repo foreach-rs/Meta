@@ -17,7 +17,7 @@ namespace ForEach.Infrastructure.External.Meta.Ads;
 /// of the normalised value, hex, lower case. What protects the customer is that only people who
 /// gave marketing consent are ever put through it.
 /// </summary>
-public static class AudienceHash
+public static partial class AudienceHash
 {
     /// <summary>
     /// An e-mail address, or null when there is nothing worth sending.
@@ -40,32 +40,51 @@ public static class AudienceHash
     /// Null, or no digits at all, gives null rather than a hash of nothing.
     /// </param>
     /// <param name="defaultCountryCode">
-    /// Prefixed when the number is written nationally — "381" here. A Serbian number typed as
-    /// 060/123-4567 is 381601234567 to Meta, and uploading it as 0601234567 matches nobody.
+    /// Prefixed when the number is written nationally — "381" here, with or without a leading
+    /// plus. A Serbian number typed as 060/123-4567 is 381601234567 to Meta, and uploading it as
+    /// 0601234567 matches nobody.
     /// </param>
     public static string? Phone(string? number, string defaultCountryCode)
     {
         if (string.IsNullOrWhiteSpace(number)) return null;
 
-        var international = number.TrimStart().StartsWith('+');
+        var trimmed = number.TrimStart();
 
-        var digits = new string([.. number.Where(char.IsAsciiDigit)]);
+        // "+381 (0)60 1234567": the "(0)" is a trunk zero shown for national dialling and is not
+        // dialled from abroad, so it goes before anything else is read.
+        trimmed = TrunkZeroInBrackets().Replace(trimmed, "");
+
+        var digits = new string([.. trimmed.Where(char.IsAsciiDigit)]);
 
         if (digits.Length == 0) return null;
 
-        if (!international && !string.IsNullOrWhiteSpace(defaultCountryCode))
-        {
-            // A national number: drop the trunk zero and put the country code in front. Done only
-            // for numbers that were not already written internationally, because "0" is a real
-            // leading digit in some country codes and stripping it there would corrupt them.
-            digits = digits.TrimStart('0');
+        var international = trimmed.StartsWith('+');
 
-            if (!digits.StartsWith(defaultCountryCode, StringComparison.Ordinal))
-                digits = defaultCountryCode + digits;
+        if (!international && digits.StartsWith("00", StringComparison.Ordinal))
+        {
+            // "00" is the international call prefix: 00381… is +381….
+            digits = digits.TrimStart('0');
+            international = true;
+        }
+
+        if (!international)
+        {
+            var country = new string([.. (defaultCountryCode ?? "").Where(char.IsAsciiDigit)]);
+
+            if (country.Length > 0)
+            {
+                // A national number: drop the trunk zero and ALWAYS put the country code in
+                // front. Not skipped when the national number happens to start with the same
+                // digits — German 0491 123456 is 49 491 123456, and 49 491… is not a duplicate.
+                digits = country + digits.TrimStart('0');
+            }
         }
 
         return digits.Length == 0 ? null : Sha256(digits);
     }
+
+    [System.Text.RegularExpressions.GeneratedRegex(@"\(\s*0\s*\)")]
+    private static partial System.Text.RegularExpressions.Regex TrunkZeroInBrackets();
 
     private static string Sha256(string value)
     {

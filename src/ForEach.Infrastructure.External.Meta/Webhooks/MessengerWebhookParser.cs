@@ -39,7 +39,8 @@ public static class MessengerWebhookParser
 
         using (document)
         {
-            if (!document.RootElement.TryGetProperty("entry", out var entries)
+            if (document.RootElement.ValueKind != JsonValueKind.Object
+                || !document.RootElement.TryGetProperty("entry", out var entries)
                 || entries.ValueKind != JsonValueKind.Array)
             {
                 return messages;
@@ -47,7 +48,8 @@ public static class MessengerWebhookParser
 
             foreach (var entry in entries.EnumerateArray())
             {
-                if (!entry.TryGetProperty("messaging", out var events)
+                if (entry.ValueKind != JsonValueKind.Object
+                    || !entry.TryGetProperty("messaging", out var events)
                     || events.ValueKind != JsonValueKind.Array)
                 {
                     continue;
@@ -67,7 +69,12 @@ public static class MessengerWebhookParser
 
     private static MetaInboundMessage? ReadMessage(JsonElement element, MetaChannel channel)
     {
-        if (!element.TryGetProperty("message", out var message)) return null;
+        if (element.ValueKind != JsonValueKind.Object
+            || !element.TryGetProperty("message", out var message)
+            || message.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
 
         // No mid, no message. Without it there is nothing to be idempotent on, and a row that
         // could be written twice is worse than one not written at all.
@@ -114,7 +121,8 @@ public static class MessengerWebhookParser
     /// </summary>
     private static string AttachmentPlaceholder(JsonElement message)
     {
-        if (!message.TryGetProperty("attachments", out var attachments)
+        if (message.ValueKind != JsonValueKind.Object
+            || !message.TryGetProperty("attachments", out var attachments)
             || attachments.ValueKind != JsonValueKind.Array)
         {
             return "[poruka bez teksta]";
@@ -136,9 +144,7 @@ public static class MessengerWebhookParser
     /// the bottom of the thread for ever, which is a message nobody sees again.
     /// </summary>
     private static DateTime Timestamp(JsonElement element) =>
-        element.TryGetProperty("timestamp", out var value) && value.TryGetInt64(out var milliseconds)
-            ? DateTimeOffset.FromUnixTimeMilliseconds(milliseconds).UtcDateTime
-            : DateTime.UtcNow;
+        MetaJson.UnixTime(element, "timestamp", milliseconds: true) ?? DateTime.UtcNow;
 
     private static string? String(JsonElement element, string name) =>
         element.ValueKind == JsonValueKind.Object

@@ -35,7 +35,8 @@ public static partial class WhatsAppTemplateReader
 
         using (document)
         {
-            if (!document.RootElement.TryGetProperty("data", out var data)
+            if (document.RootElement.ValueKind != JsonValueKind.Object
+                || !document.RootElement.TryGetProperty("data", out var data)
                 || data.ValueKind != JsonValueKind.Array)
             {
                 return templates;
@@ -72,7 +73,8 @@ public static partial class WhatsAppTemplateReader
     /// </summary>
     private static string? Body(JsonElement element)
     {
-        if (!element.TryGetProperty("components", out var components)
+        if (element.ValueKind != JsonValueKind.Object
+            || !element.TryGetProperty("components", out var components)
             || components.ValueKind != JsonValueKind.Array)
         {
             return null;
